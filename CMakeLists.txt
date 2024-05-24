@@ -3,4 +3,6 @@ project(ShiftXorLRC)
 
 set(CMAKE_CXX_STANDARD 17)
 
-add_executable(ShiftXorLRC main.cpp)
+add_executable(ShiftXorLRC main.cpp
+        Encoder.cpp
+        Encoder.h)
