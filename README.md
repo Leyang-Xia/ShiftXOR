@@ -53,11 +53,6 @@
 - [ ] 优化内存使用
 - [ ] 添加错误检测和恢复功能
 
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request。
-
 ## 作者
 
-LeyangXia CUHKSZ
+LeyangXia 
