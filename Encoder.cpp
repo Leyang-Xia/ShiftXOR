@@ -1,23 +1,15 @@
-// encoder.cpp
-
 #include "Encoder.h"
+#include <iostream>
+#include <thread>
 
-
-// Constructor with message input and default matrix type
-Encoder::Encoder(const vector<vector<int>>& message, int n, MatrixType matrixType)
+Encoder::Encoder(const vector<vector<uint8_t>>& message, int n, MatrixType matrixType)
         : messages(message), n(n), matrixType(matrixType) {
     k = message.size();
     L = message[0].size();
     generatorMatrix = vector<vector<int>>(n, vector<int>(k, 0));
 
-    if (matrixType == MatrixType::RID) {
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < k; ++j) {
-                generatorMatrix[i][j] = (i * j); // RID matrix: default shift values
-            }
-        }
-    } else if (matrixType == MatrixType::TWO_TONE) {
-        int d = n / 2; // divide d, ensure d covers half of the n
+    if (matrixType == MatrixType::TWO_TONE) {
+        int d = n / 2;
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < k; ++j) {
                 if (i < d) {
@@ -28,21 +20,83 @@ Encoder::Encoder(const vector<vector<int>>& message, int n, MatrixType matrixTyp
             }
         }
     }
+    else if (matrixType == MatrixType::SYSTEMATIC_TWOTONE) {
+        // 前k行为单位矩阵（原始数据）
+        for (int i = 0; i < k; ++i) {
+            for (int j = 0; j < k; ++j) {
+                generatorMatrix[i][j] = (i == j) ? 0 : INT_MAX; // 0表示不移位，INT_MAX表示不参与异或
+            }
+        }
+
+        // 后(n-k)行为Two-tone矩阵（冗余数据）
+        int d = (n - k) / 2;
+        for (int i = k; i < n; ++i) {
+            for (int j = 0; j < k; ++j) {
+                if (i < k + d) {
+                    generatorMatrix[i][j] = (d - (i - k)) * (k - j - 1);
+                } else {
+                    generatorMatrix[i][j] = ((i - k) - d) * j;
+                }
+            }
+        }
+    }
+    else if (matrixType == MatrixType::SYSTEMATIC_RID) {
+        // 前k行为单位矩阵（原始数据）
+        for (int i = 0; i < k; ++i) {
+            for (int j = 0; j < k; ++j) {
+                generatorMatrix[i][j] = (i == j) ? 0 : INT_MAX;
+            }
+        }
+
+        // 后(n-k)行为RID矩阵（冗余数据）
+        for (int i = k; i < n; ++i) {
+            for (int j = 0; j < k; ++j) {
+                generatorMatrix[i][j] = (i - k + 1) * j;
+            }
+        }
+    }
 }
 
-// Constructor with message and generator matrix input
-Encoder::Encoder(const vector<vector<int>>& message, const vector<vector<int>>& generatorMatrix)
-        : messages(message), generatorMatrix(generatorMatrix), matrixType(MatrixType::CUSTOMIZE) { // default matrixType if matrix is given
-    n = generatorMatrix.size();
-    k = generatorMatrix[0].size();
-    L = message[0].size();
+// 优化的移位异或操作
+void Encoder::fastShiftXOR(uint8_t* dest, const uint8_t* src, int shift, int length) {
+    int byteShift = shift / 8;
+    int bitShift = shift % 8;
+
+    if (bitShift == 0) {
+        // 按字节对齐的情况
+        for (int i = 0; i < (length - shift) / 8; ++i) {
+            dest[byteShift + i] ^= src[i];
+        }
+    } else {
+        // 非字节对齐的情况
+        uint16_t buffer;
+        for (int i = 0; i < (length - shift) / 8; ++i) {
+            buffer = (src[i] << bitShift);
+            if (i + 1 < length / 8) {
+                buffer |= (src[i + 1] >> (8 - bitShift));
+            }
+            dest[byteShift + i] ^= buffer & 0xFF;
+        }
+    }
 }
 
-vector<vector<int>> Encoder::encode() {
-    vector<vector<int>> encodedMessage(n, vector<int>(L, 0));
+void Encoder::encodeWorker(int startRow, int endRow, vector<vector<uint8_t>>& encodedMessage, const vector<int>& t_star) {
+    for (int i = startRow; i < endRow; ++i) {
+        for (int j = 0; j < k; ++j) {
+            if (generatorMatrix[i][j] != INT_MAX) {
+                fastShiftXOR(encodedMessage[i].data(),
+                           messages[j].data(),
+                           generatorMatrix[i][j],
+                           L + t_star[i]);
+            }
+        }
+    }
+}
+
+vector<vector<uint8_t>> Encoder::encode() {
     vector<int> t_star(n, 0);
 
-    // Precompute t_star values
+    // 计算每行的最大移位
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < k; ++j) {
             if (generatorMatrix[i][j] != INT_MAX) {
@@ -51,33 +105,39 @@ vector<vector<int>> Encoder::encode() {
         }
     }
 
-    // Resize encodedMessage to the correct lengths
+    // 初始化编码结果
+    vector<vector<uint8_t>> encodedMessage(n);
     for (int i = 0; i < n; ++i) {
-        encodedMessage[i].resize(L + t_star[i], 0);
+        encodedMessage[i].resize((L + t_star[i] + 7) / 8 * 8, 0);
     }
 
-    // Encode messages
-    for (int j = 0; j < k; ++j) {
-        for (int i = 0; i < n; ++i) {
-            if (generatorMatrix[i][j] != INT_MAX) {
-                vector<int> shiftedMessage = rightShift(messages[j], generatorMatrix[i][j], L + t_star[i]);
-                for (int bit = 0; bit < L + t_star[i]; ++bit) {
-                    encodedMessage[i][bit] ^= shiftedMessage[bit];
-                }
-            }
-        }
+    // 使用多线程并行计算
+    const int numThreads = thread::hardware_concurrency();
+    vector<thread> threads;
+    int rowsPerThread = n / numThreads;
+
+    for (int i = 0; i < numThreads; ++i) {
+        int startRow = i * rowsPerThread;
+        int endRow = (i == numThreads - 1) ? n : (i + 1) * rowsPerThread;
+        threads.emplace_back(&Encoder::encodeWorker, this, startRow, endRow,
+                           ref(encodedMessage), ref(t_star));
+    }
+
+    for (auto& t : threads) {
+        t.join();
     }
 
     return encodedMessage;
 }
 
-vector<int> Encoder::rightShift(const vector<int>& vec, int shift, int newLength) {
-    int n = vec.size();
-    vector<int> result(newLength, 0);
-    for (int i = 0; i < n; ++i) {
-        if (i + shift < newLength) {
-            result[i + shift] = vec[i];
-        }
+double Encoder::benchmarkEncode(int iterations) {
+    auto start = chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < iterations; ++i) {
+        encode();
     }
-    return result;
+
+    auto end = chrono::high_resolution_clock::now();
+    chrono::duration<double> diff = end - start;
+    return diff.count() / iterations;
 }
